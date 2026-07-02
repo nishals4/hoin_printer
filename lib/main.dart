@@ -151,7 +151,7 @@ class _SettingsPageState extends State<SettingsPage> {
       _printerMode = prefs.getString('printer_mode') ?? 'bluetooth';
       _ipController.text = prefs.getString('printer_ip') ?? '';
       _portController.text = prefs.getString('printer_port') ?? '9100';
-      _apiController.text = prefs.getString('api_url') ?? 'http://192.168.1.76:3000';
+      _apiController.text = prefs.getString('api_url') ?? 'http://192.168.1.76:4000';
     });
   }
 
