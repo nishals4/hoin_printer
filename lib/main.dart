@@ -1,115 +1,18 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:barcode/barcode.dart';
-import 'package:file_picker/file_picker.dart';
-import 'package:excel/excel.dart' hide TextSpan;
-import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:flutter/foundation.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:sqflite/sqflite.dart';
-import 'package:path/path.dart' as p;
+import 'package:http/http.dart' as http;
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const LabelPrinterApp());
-}
-
-// ============================================================================
-// SQLITE DATABASE HELPER
-// ============================================================================
-class DatabaseHelper {
-  static final DatabaseHelper instance = DatabaseHelper._init();
-  static Database? _database;
-
-  DatabaseHelper._init();
-
-  Future<Database> get database async {
-    if (_database != null) return _database!;
-    _database = await _initDB('inventory.db');
-    return _database!;
-  }
-
-  Future<Database> _initDB(String filePath) async {
-    final dbPath = await getDatabasesPath();
-    final path = p.join(dbPath, filePath);
-
-    return await openDatabase(path, version: 1, onCreate: _createDB);
-  }
-
-  Future _createDB(Database db, int version) async {
-    await db.execute('''
-      CREATE TABLE items (
-        id TEXT PRIMARY KEY,
-        name TEXT,
-        sku TEXT,
-        price TEXT,
-        was_price TEXT
-      )
-    ''');
-  }
-
-  Future<void> insertItemsBatch(List<Map<String, dynamic>> items) async {
-    final db = await instance.database;
-    Batch batch = db.batch();
-
-    batch.delete('items');
-
-    for (var item in items) {
-      batch.insert('items', item, conflictAlgorithm: ConflictAlgorithm.replace);
-    }
-    await batch.commit(noResult: true);
-  }
-
-  Future<Map<String, dynamic>?> getItem(String id) async {
-    final db = await instance.database;
-    final maps = await db.query(
-      'items',
-      where: 'id = ?',
-      whereArgs: [id],
-    );
-
-    if (maps.isNotEmpty) return maps.first;
-    return null;
-  }
-
-  Future<int> getCount() async {
-    final db = await instance.database;
-    final count = Sqflite.firstIntValue(await db.rawQuery('SELECT COUNT(*) FROM items'));
-    return count ?? 0;
-  }
-}
-
-// ============================================================================
-// BACKGROUND THREAD WORKER (Excel -> List of SQL Rows)
-// ============================================================================
-List<Map<String, dynamic>> parseExcelInIsolate(Uint8List bytes) {
-  var excel = Excel.decodeBytes(bytes);
-  List<Map<String, dynamic>> parsedList = [];
-
-  for (var table in excel.tables.keys) {
-    for (var row in excel.tables[table]?.rows ?? []) {
-      if (row.length > 2 && row[2] != null) {
-        String id = row[2]!.value.toString().trim();
-        if (id.toLowerCase() == 'sku' || id.toLowerCase() == 'barcode') continue;
-
-        parsedList.add({
-          "id": id,
-          "name": row.length > 1 && row[1] != null ? row[1]!.value.toString() : "Unknown Name",
-          "sku": row.length > 0 && row[0] != null ? row[0]!.value.toString() : "NO-ALU",
-          "price": row.length > 4 && row[4] != null ? row[4]!.value.toString() : "0.00",
-          "was_price": row.length > 5 && row[5] != null && row[5]!.value.toString().trim().isNotEmpty
-              ? row[5]!.value.toString().trim()
-              : "0.00",
-        });
-      }
-    }
-  }
-  return parsedList;
 }
 
 class LabelPrinterApp extends StatelessWidget {
@@ -232,6 +135,9 @@ class _SettingsPageState extends State<SettingsPage> {
   String _printerMode = 'bluetooth';
   final TextEditingController _ipController = TextEditingController();
   final TextEditingController _portController = TextEditingController();
+  final TextEditingController _apiController = TextEditingController();
+
+  bool _isCheckingServer = false;
 
   @override
   void initState() {
@@ -245,28 +151,74 @@ class _SettingsPageState extends State<SettingsPage> {
       _printerMode = prefs.getString('printer_mode') ?? 'bluetooth';
       _ipController.text = prefs.getString('printer_ip') ?? '';
       _portController.text = prefs.getString('printer_port') ?? '9100';
+      _apiController.text = prefs.getString('api_url') ?? 'http://192.168.1.76:3000';
     });
   }
 
   Future<void> _saveSettings() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('printer_mode', _printerMode);
-    await prefs.setString('printer_ip', _ipController.text.trim());
-    await prefs.setString('printer_port', _portController.text.trim());
+    String apiUrl = _apiController.text.trim();
+    if (apiUrl.endsWith('/')) apiUrl = apiUrl.substring(0, apiUrl.length - 1);
 
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Settings Saved Successfully!"), backgroundColor: Colors.green));
+    setState(() {
+      _isCheckingServer = true;
+    });
+
+    bool isReachable = false;
+
+    try {
+      final uri = Uri.parse(apiUrl);
+      final response = await http.get(uri).timeout(const Duration(seconds: 3));
+      if (response.statusCode != null) {
+        isReachable = true;
+      }
+    } catch (e) {
+      isReachable = false;
+    }
+
+    if (!mounted) return;
+
+    setState(() {
+      _isCheckingServer = false;
+    });
+
+    if (isReachable) {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('printer_mode', _printerMode);
+      await prefs.setString('printer_ip', _ipController.text.trim());
+      await prefs.setString('printer_port', _portController.text.trim());
+      await prefs.setString('api_url', apiUrl);
+
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text("Settings Saved! API Server is reachable ✅"),
+          backgroundColor: Colors.green
+      ));
       Navigator.pop(context);
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text("Cannot reach server. Check the IP and ensure the Node.js app is running ❌"),
+        backgroundColor: Colors.red,
+        duration: Duration(seconds: 4),
+      ));
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text("Printer Settings")),
+      appBar: AppBar(title: const Text("Settings")),
       body: ListView(
         padding: const EdgeInsets.all(16.0),
         children: [
+          const Text("Database Server", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _apiController,
+            decoration: const InputDecoration(labelText: 'Node.js API URL', border: OutlineInputBorder(), hintText: 'e.g. http://192.168.1.76:3000'),
+            keyboardType: TextInputType.url,
+          ),
+
+          const Divider(height: 32),
+
           const Text("Printer Connection Mode", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
           RadioListTile<String>(
@@ -283,9 +235,9 @@ class _SettingsPageState extends State<SettingsPage> {
             groupValue: _printerMode,
             onChanged: (value) => setState(() => _printerMode = value!),
           ),
-          const Divider(height: 32),
 
           if (_printerMode == 'server') ...[
+            const Divider(height: 32),
             const Text("Network Printer Configuration", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
             const SizedBox(height: 16),
             TextField(
@@ -299,14 +251,20 @@ class _SettingsPageState extends State<SettingsPage> {
               decoration: const InputDecoration(labelText: 'Printer Port', border: OutlineInputBorder(), hintText: 'e.g. 9100'),
               keyboardType: TextInputType.number,
             ),
-            const SizedBox(height: 24),
           ],
 
+          const SizedBox(height: 24),
           ElevatedButton.icon(
-            onPressed: _saveSettings,
-            icon: const Icon(Icons.save),
-            label: const Text("SAVE SETTINGS"),
-            style: ElevatedButton.styleFrom(minimumSize: const Size.fromHeight(50), backgroundColor: Colors.blueGrey, foregroundColor: Colors.white),
+            onPressed: _isCheckingServer ? null : _saveSettings,
+            icon: _isCheckingServer
+                ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                : const Icon(Icons.save),
+            label: Text(_isCheckingServer ? "CHECKING CONNECTION..." : "SAVE SETTINGS"),
+            style: ElevatedButton.styleFrom(
+                minimumSize: const Size.fromHeight(50),
+                backgroundColor: Colors.blueGrey,
+                foregroundColor: Colors.white
+            ),
           )
         ],
       ),
@@ -330,20 +288,23 @@ class _LabelPrinterHomePageState extends State<LabelPrinterHomePage> {
   String _printerMode = 'bluetooth';
   String _printerIp = '';
   String _printerPort = '';
+  String _apiUrl = 'http://192.168.1.76:3000';
 
-  // Bluetooth Settings
+  // State Variables
+  DateTime _targetDate = DateTime.now(); // Defaults to today
+  String _lastScannedCode = '';
+
   List<Map<dynamic, dynamic>> _devices = [];
   Map<dynamic, dynamic>? _selectedDevice;
   bool _connected = false;
   bool _isScanning = false;
-  bool _isLoadingDatabase = false;
+  bool _isLookingUp = false;
 
   final TextEditingController _inputController = TextEditingController();
   final FocusNode _inputFocusNode = FocusNode();
 
   Map<String, dynamic>? _scannedItem;
   int _quantity = 1;
-  int _inventoryCount = 0;
 
   String _labelFormat = 'was-now';
   String _labelSize = '76x51';
@@ -353,7 +314,6 @@ class _LabelPrinterHomePageState extends State<LabelPrinterHomePage> {
     super.initState();
     platform.setMethodCallHandler(_handleNativeMethodCall);
     _loadNetworkSettings();
-    _autoLoadDatabaseCount();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _inputFocusNode.requestFocus();
     });
@@ -365,6 +325,7 @@ class _LabelPrinterHomePageState extends State<LabelPrinterHomePage> {
       _printerMode = prefs.getString('printer_mode') ?? 'bluetooth';
       _printerIp = prefs.getString('printer_ip') ?? '';
       _printerPort = prefs.getString('printer_port') ?? '9100';
+      _apiUrl = prefs.getString('api_url') ?? 'http://192.168.1.76:3000';
     });
 
     if (_printerMode == 'bluetooth') {
@@ -409,66 +370,86 @@ class _LabelPrinterHomePageState extends State<LabelPrinterHomePage> {
     setState(() { _connected = false; _selectedDevice = null; });
   }
 
-  Future<void> _autoLoadDatabaseCount() async {
-    int count = await DatabaseHelper.instance.getCount();
-    setState(() {
-      _inventoryCount = count;
-    });
-  }
-
-  Future<void> _loadExcelDatabase() async {
-    setState(() => _isLoadingDatabase = true);
-    try {
-      FilePickerResult? result = await FilePicker.platform.pickFiles(type: FileType.custom, allowedExtensions: ['xlsx'], withData: true);
-      if (result != null) {
-        Uint8List? bytes = result.files.single.bytes;
-        if (bytes == null) {
-          File pickedFile = File(result.files.single.path!);
-          bytes = pickedFile.readAsBytesSync();
-        }
-
-        List<Map<String, dynamic>> parsedList = await compute(parseExcelInIsolate, bytes);
-        await DatabaseHelper.instance.insertItemsBatch(parsedList);
-
-        int count = await DatabaseHelper.instance.getCount();
-        setState(() { _inventoryCount = count; });
-
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Database created! $_inventoryCount items loaded.", style: const TextStyle(color: Colors.white)), backgroundColor: Colors.green));
-        }
+  // ============================================================================
+  // DATE PICKER LOGIC
+  // ============================================================================
+  Future<void> _pickDate(BuildContext context) async {
+    final DateTime? picked = await showDatePicker(
+      context: context,
+      initialDate: _targetDate,
+      firstDate: DateTime(2020),
+      lastDate: DateTime(2035),
+    );
+    if (picked != null && picked != _targetDate) {
+      setState(() {
+        _targetDate = picked;
+      });
+      if (_lastScannedCode.isNotEmpty) {
+        _handleItemLookup(_lastScannedCode);
       }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Failed to load Excel file: $e", style: const TextStyle(color: Colors.white)), backgroundColor: Colors.red));
-      }
-    } finally {
-      setState(() => _isLoadingDatabase = false);
     }
   }
 
+  // ============================================================================
+  // NODE.JS API LOOKUP
+  // ============================================================================
   Future<void> _handleItemLookup(String value) async {
     final cleanCode = value.trim();
     if (cleanCode.isEmpty) return;
 
-    final item = await DatabaseHelper.instance.getItem(cleanCode);
+    _lastScannedCode = cleanCode;
 
     setState(() {
-      if (item != null) {
-        _scannedItem = item;
-      } else {
-        _scannedItem = {"id": cleanCode, "name": "Item Not Found in DB", "sku": "N/A", "price": "0.00", "was_price": "0.00"};
-      }
-      _quantity = 1;
+      _isLookingUp = true;
+      _scannedItem = null;
     });
 
-    _inputController.clear();
-    _inputFocusNode.requestFocus();
+    try {
+      final formattedDate = _targetDate.toIso8601String().split('T')[0];
+      final url = Uri.parse('$_apiUrl/api/lookup?sku=$cleanCode&targetDate=$formattedDate');
+
+      final response = await http.get(url).timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+
+        setState(() {
+          _scannedItem = {
+            "id": data['sku'] ?? cleanCode,
+            "name": data['article_name'] ?? "Unknown Name",
+            "sku": data['sku'] ?? "N/A",
+            "price": data['special_price'] != null ? data['special_price'].toString() : data['base_price'].toString(),
+            "was_price": data['base_price']?.toString() ?? "0.00",
+          };
+          _quantity = 1;
+        });
+      } else if (response.statusCode == 404) {
+        setState(() {
+          _scannedItem = {
+            "id": cleanCode,
+            "name": "Item Not Found on Server",
+            "sku": "N/A",
+            "price": "0.00",
+            "was_price": "0.00"
+          };
+          _quantity = 1;
+        });
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Server Error: ${response.statusCode}"), backgroundColor: Colors.red));
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Network Error: Could not connect to API"), backgroundColor: Colors.red));
+    } finally {
+      setState(() => _isLookingUp = false);
+      _inputController.clear();
+      _inputFocusNode.unfocus();
+    }
   }
 
   // ============================================================================
   // ESC/POS DIRECT TCP PRINTING
   // ============================================================================
-  Future<void> _printViaServer(Uint8List monoBytes, int labelWidth, int labelHeight) async {
+  Future<void> _printViaServer(Uint8List monoBytes, int labelWidth, int labelHeight, int qty) async {
     if (_printerIp.isEmpty || _printerPort.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
           content: Text("Error: Printer IP or Port is empty in Settings."), backgroundColor: Colors.red));
@@ -477,31 +458,52 @@ class _LabelPrinterHomePageState extends State<LabelPrinterHomePage> {
 
     try {
       int port = int.parse(_printerPort);
+      // Timeout is just for the initial connection
       Socket socket = await Socket.connect(_printerIp, port, timeout: const Duration(seconds: 5));
 
       int bytesPerLine = (labelWidth + 7) ~/ 8;
 
-      // ESC/POS Command Wrapper
-      List<int> payload = [];
+      // 1. Prepare Header
+      List<int> header = [
+        29, 118, 48, 0, // GS v 0 : Print Raster Image
+        bytesPerLine % 256, bytesPerLine ~/ 256,
+        labelHeight % 256, labelHeight ~/ 256
+      ];
 
-      // --- THE FIX ---
-      // 1. Removed `[27, 64]` (ESC @) because it wipes the printer's hardware gap calibration!
+      // 2. Loop for copies
+      for (int q = 0; q < qty; q++) {
+        socket.add(header);
 
-      payload.addAll([29, 118, 48, 0]); // GS v 0 : Print Raster Image
-      payload.add(bytesPerLine % 256);
-      payload.add(bytesPerLine ~/ 256);
-      payload.add(labelHeight % 256);
-      payload.add(labelHeight ~/ 256);
+        // 🛑 THE FIX: Chunking the data.
+        // We split the image bytes into 1KB chunks and add a tiny 5ms delay.
+        // This prevents the printer's network memory buffer from filling up and dropping
+        // packets when printing complex images (like the dense "was-now" format).
+        int chunkSize = 1024;
+        for (int i = 0; i < monoBytes.length; i += chunkSize) {
+          int end = i + chunkSize;
+          if (end > monoBytes.length) end = monoBytes.length;
 
-      // Add the actual generated image data
-      payload.addAll(monoBytes);
+          socket.add(monoBytes.sublist(i, end));
+          await socket.flush(); // Push to OS
+          await Future.delayed(const Duration(milliseconds: 5)); // Let the thermal head breathe
+        }
 
-      // 2. Swapped `12` for `[29, 12]` (GS FF) which specifically means "Feed to Next Label Gap".
-      payload.addAll([29, 12]);
+        // 3. Form feed to next gap
+        socket.add([29, 12]);
+        await socket.flush();
 
-      socket.add(payload);
-      await socket.flush();
+        // Extra delay between physical labels to prevent roller jamming
+        if (qty > 1) {
+          await Future.delayed(const Duration(milliseconds: 300));
+        }
+      }
+
+      // Final delay to ensure the OS completes transmitting the last TCP packets over Wi-Fi
+      await Future.delayed(const Duration(milliseconds: 500));
+
+      // Forcefully terminate to clear any TIME_WAIT state issues
       await socket.close();
+      socket.destroy();
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
@@ -523,7 +525,8 @@ class _LabelPrinterHomePageState extends State<LabelPrinterHomePage> {
     }
 
     final int labelWidth = _labelSize == '76x51' ? 576 : (_labelSize == '50x38' ? 400 : 480);
-    final int labelHeight = _labelSize == '76x51' ? 384 : (_labelSize == '50x38' ? 280 : 208);
+    final int labelHeight = _labelSize == '76x51' ? 408 : (_labelSize == '50x38' ? 304 : 232);
+
     final int widthMm = _labelSize == '76x51' ? 76 : (_labelSize == '50x38' ? 50 : 60);
     final int heightMm = _labelSize == '76x51' ? 51 : (_labelSize == '50x38' ? 38 : 29);
     final int gapMm = _labelSize == '76x51' ? 3 : 2;
@@ -559,19 +562,19 @@ class _LabelPrinterHomePageState extends State<LabelPrinterHomePage> {
         _drawCenteredText(canvas, "QR ${_scannedItem!['price']}", 205, labelWidth, fontSize: 36, fontWeight: FontWeight.bold);
         _drawRightText(canvas, "بعد", labelWidth - 150, 210, fontSize: 24);
 
-        canvas.drawLine(const Offset(20, 255), const Offset(556, 255), linePaint);
+        canvas.drawLine(const Offset(20, 260), const Offset(556, 260), linePaint);
 
-        _drawCenteredText(canvas, "SKU: ${_scannedItem!['id']}", 265, labelWidth, fontSize: 18);
-        _drawRealBarcode(canvas, _scannedItem!['id'].toString(), 285, labelWidth, 60);
+        _drawCenteredText(canvas, "SKU: ${_scannedItem!['id']}", 270, labelWidth, fontSize: 18);
+        _drawRealBarcode(canvas, _scannedItem!['id'].toString(), 295, labelWidth, 60);
       } else {
         _drawCenteredText(canvas, _scannedItem!['sku'].toString(), 50, labelWidth, fontSize: 24, fontWeight: FontWeight.bold);
         _drawCenteredText(canvas, _scannedItem!['name'].toString(), 100, labelWidth, fontSize: 22);
         canvas.drawLine(const Offset(20, 145), const Offset(556, 145), linePaint);
         _drawCenteredText(canvas, "QR ${_scannedItem!['price']}", 170, labelWidth, fontSize: 40, fontWeight: FontWeight.bold);
-        canvas.drawLine(const Offset(20, 230), const Offset(556, 230), linePaint);
+        canvas.drawLine(const Offset(20, 235), const Offset(556, 235), linePaint);
 
-        _drawCenteredText(canvas, "SKU: ${_scannedItem!['id']}", 240, labelWidth, fontSize: 18);
-        _drawRealBarcode(canvas, _scannedItem!['id'].toString(), 265, labelWidth, 60);
+        _drawCenteredText(canvas, "SKU: ${_scannedItem!['id']}", 245, labelWidth, fontSize: 18);
+        _drawRealBarcode(canvas, _scannedItem!['id'].toString(), 275, labelWidth, 60);
       }
     }
     // ====================================================================
@@ -596,20 +599,20 @@ class _LabelPrinterHomePageState extends State<LabelPrinterHomePage> {
         _drawCenteredText(canvas, "QR ${_scannedItem!['price']}", 110, labelWidth, fontSize: 24, fontWeight: FontWeight.bold);
         _drawRightText(canvas, "بعد", labelWidth - 80, 110, fontSize: 18, fontWeight: FontWeight.bold);
 
-        canvas.drawLine(const Offset(15, 145), const Offset(385, 145), linePaint);
+        canvas.drawLine(const Offset(15, 150), const Offset(385, 150), linePaint);
 
-        _drawCenteredText(canvas, "SKU: ${_scannedItem!['id']}", 155, labelWidth, fontSize: 14);
-        _drawRealBarcode(canvas, _scannedItem!['id'].toString(), 180, labelWidth, 50);
+        _drawCenteredText(canvas, "SKU: ${_scannedItem!['id']}", 165, labelWidth, fontSize: 14);
+        _drawRealBarcode(canvas, _scannedItem!['id'].toString(), 190, labelWidth, 50);
       } else {
         _drawCenteredText(canvas, _scannedItem!['sku'].toString(), 15, labelWidth, fontSize: 18, fontWeight: FontWeight.bold);
         _drawCenteredText(canvas, _scannedItem!['name'].toString(), 45, labelWidth, fontSize: 14);
         canvas.drawLine(const Offset(15, 75), const Offset(385, 75), linePaint);
 
         _drawCenteredText(canvas, "QR ${_scannedItem!['price']}", 105, labelWidth, fontSize: 32, fontWeight: FontWeight.bold);
-        canvas.drawLine(const Offset(15, 150), const Offset(385, 150), linePaint);
+        canvas.drawLine(const Offset(15, 155), const Offset(385, 155), linePaint);
 
-        _drawCenteredText(canvas, "SKU: ${_scannedItem!['id']}", 165, labelWidth, fontSize: 14);
-        _drawRealBarcode(canvas, _scannedItem!['id'].toString(), 185, labelWidth, 50);
+        _drawCenteredText(canvas, "SKU: ${_scannedItem!['id']}", 170, labelWidth, fontSize: 14);
+        _drawRealBarcode(canvas, _scannedItem!['id'].toString(), 195, labelWidth, 50);
       }
     }
     // ====================================================================
@@ -634,10 +637,10 @@ class _LabelPrinterHomePageState extends State<LabelPrinterHomePage> {
         _drawCenteredText(canvas, "QR ${_scannedItem!['price']}", 90, labelWidth, fontSize: 22, fontWeight: FontWeight.bold);
         _drawRightText(canvas, "بعد", labelWidth - 100, 91, fontSize: 18, fontWeight: FontWeight.bold);
 
-        canvas.drawLine(const Offset(10, 125), const Offset(470, 125), linePaint);
+        canvas.drawLine(const Offset(10, 130), const Offset(470, 130), linePaint);
 
-        _drawCenteredText(canvas, "SKU: ${_scannedItem!['id']}", 130, labelWidth, fontSize: 12);
-        _drawRealBarcode(canvas, _scannedItem!['id'].toString(), 145, labelWidth, 40);
+        _drawCenteredText(canvas, "SKU: ${_scannedItem!['id']}", 135, labelWidth, fontSize: 12);
+        _drawRealBarcode(canvas, _scannedItem!['id'].toString(), 155, labelWidth, 40);
       } else {
         _drawCenteredText(canvas, _scannedItem!['sku'].toString(), 10, labelWidth, fontSize: 16, fontWeight: FontWeight.bold);
         _drawCenteredText(canvas, _scannedItem!['name'].toString(), 35, labelWidth, fontSize: 14);
@@ -647,7 +650,7 @@ class _LabelPrinterHomePageState extends State<LabelPrinterHomePage> {
         canvas.drawLine(const Offset(10, 120), const Offset(470, 120), linePaint);
 
         _drawCenteredText(canvas, "SKU: ${_scannedItem!['id']}", 130, labelWidth, fontSize: 12);
-        _drawRealBarcode(canvas, _scannedItem!['id'].toString(), 145, labelWidth, 45);
+        _drawRealBarcode(canvas, _scannedItem!['id'].toString(), 150, labelWidth, 45);
       }
     }
 
@@ -658,7 +661,6 @@ class _LabelPrinterHomePageState extends State<LabelPrinterHomePage> {
     if (byteData != null) {
       final Uint8List rgbaBytes = byteData.buffer.asUint8List();
 
-      // --- DUAL LANGUAGE BRANCH LOGIC ---
       if (_printerMode == 'bluetooth') {
         final Uint8List tsplBytes = _convertTo1BitDitheredRaster(rgbaBytes, labelWidth, labelHeight, invert: false);
         try {
@@ -671,9 +673,7 @@ class _LabelPrinterHomePageState extends State<LabelPrinterHomePage> {
         }
       } else {
         final Uint8List escPosBytes = _convertTo1BitDitheredRaster(rgbaBytes, labelWidth, labelHeight, invert: true);
-        for (int i = 0; i < _quantity; i++) {
-          await _printViaServer(escPosBytes, labelWidth, labelHeight);
-        }
+        await _printViaServer(escPosBytes, labelWidth, labelHeight, _quantity);
       }
     }
   }
@@ -747,11 +747,8 @@ class _LabelPrinterHomePageState extends State<LabelPrinterHomePage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Native SDK Label Station'),
+        title: const Text('Network Label Station'),
         actions: [
-          _isLoadingDatabase
-              ? const Padding(padding: EdgeInsets.symmetric(horizontal: 16.0), child: Center(child: SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))))
-              : IconButton(icon: const Icon(Icons.folder_open), tooltip: "Load Excel Database", onPressed: _loadExcelDatabase),
           IconButton(
               icon: const Icon(Icons.settings),
               tooltip: "Settings",
@@ -767,12 +764,6 @@ class _LabelPrinterHomePageState extends State<LabelPrinterHomePage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            if (_inventoryCount > 0)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 8.0),
-                child: Text("Database Active: $_inventoryCount items loaded.", style: const TextStyle(color: Colors.green, fontWeight: FontWeight.bold), textAlign: TextAlign.center),
-              ),
-
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(12.0),
@@ -812,13 +803,56 @@ class _LabelPrinterHomePageState extends State<LabelPrinterHomePage> {
             ),
 
             const SizedBox(height: 16),
+
+            // --- UPDATED CLICKABLE DATE PICKER UI ---
+            Card(
+              color: Colors.white,
+              elevation: 0,
+              clipBehavior: Clip.antiAlias, // Keeps the InkWell ripple inside the rounded corners
+              shape: RoundedRectangleBorder(
+                side: BorderSide(color: Colors.blueGrey.shade200, width: 1),
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: InkWell(
+                onTap: () => _pickDate(context),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 12.0),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.calendar_month, color: Colors.blueGrey),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          "Target Date: ${_targetDate.toIso8601String().split('T')[0]}",
+                          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      const Text(
+                        "CHANGE",
+                        style: TextStyle(color: Colors.blueGrey, fontWeight: FontWeight.bold, fontSize: 14),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            // -----------------------------
+
             TextField(
               controller: _inputController,
               focusNode: _inputFocusNode,
-              decoration: const InputDecoration(labelText: 'Scan Barcode or Enter Serial Manually', prefixIcon: Icon(Icons.qr_code_scanner), border: OutlineInputBorder()),
-              onSubmitted: _handleItemLookup,
+              decoration: InputDecoration(
+                  labelText: 'Scan Barcode or Enter Serial Manually',
+                  prefixIcon: const Icon(Icons.qr_code_scanner),
+                  suffixIcon: _isLookingUp ? const Padding(padding: EdgeInsets.all(12.0), child: CircularProgressIndicator(strokeWidth: 2)) : null,
+                  border: const OutlineInputBorder()
+              ),
+              onSubmitted: _isLookingUp ? null : _handleItemLookup,
             ),
             const SizedBox(height: 16),
+
             _scannedItem == null
                 ? const Padding(padding: EdgeInsets.symmetric(vertical: 40.0), child: Center(child: Text("Ready for barcode or serial entry...")))
                 : Card(
